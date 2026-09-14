@@ -9,12 +9,15 @@ import {
   ADMIN_PASSWORD,
   BASE_PORT,
   workerBaseUrl,
-  workerDbDir,
+  workerDbSchema,
+  workerDbUrl,
   workerAuthFile,
   SERVER_PIDS_FILE,
 } from './config'
+import { Client } from 'pg'
 import { buildNext } from '../scripts/next-build'
 import { createApiClient } from './client'
+import { resolveDbUrl } from '../lib/db-url'
 
 const PROJECT_ROOT = path.resolve(__dirname, '..')
 const NEXT_BINARY = path.join(PROJECT_ROOT, 'node_modules', '.bin', 'next')
@@ -22,7 +25,9 @@ const PRISMA_BINARY = path.join(PROJECT_ROOT, 'node_modules', '.bin', 'prisma')
 
 function killServerOnPort(port: number): void {
   try {
-    execSync(`lsof -ti :${port} | xargs kill -TERM 2>/dev/null || true`, { shell: '/bin/sh' })
+    execSync(`lsof -ti :${port} -sTCP:LISTEN | xargs kill -TERM 2>/dev/null || true`, {
+      shell: '/bin/sh',
+    })
   } catch {
     // nothing listening
   }
@@ -45,24 +50,26 @@ function generatePrismaClient(): void {
   execSync('npm run generate', { cwd: PROJECT_ROOT, stdio: 'pipe' })
 }
 
-function migrateWorkerDb(parallelIndex: number): void {
-  const dbDir = workerDbDir(parallelIndex)
-  const dbUrl = `file:${path.join(dbDir, 'catalyse.db')}`
+async function migrateWorkerDb(parallelIndex: number): Promise<void> {
+  const client = new Client({ connectionString: resolveDbUrl() })
+  await client.connect()
+  try {
+    await client.query(`DROP SCHEMA IF EXISTS "${workerDbSchema(parallelIndex)}" CASCADE`)
+  } finally {
+    await client.end()
+  }
   execSync(`${PRISMA_BINARY} migrate deploy`, {
     cwd: PROJECT_ROOT,
-    env: { ...process.env, DATABASE_URL: dbUrl },
+    env: { ...process.env, DATABASE_URL: workerDbUrl(parallelIndex) },
     stdio: 'pipe',
   })
 }
 
-function startWorkerNextJs(parallelIndex: number): number {
+async function startWorkerNextJs(parallelIndex: number): Promise<number> {
   const nextPort = BASE_PORT + parallelIndex
-  const dbDir = workerDbDir(parallelIndex)
 
   killServerOnPort(nextPort)
-  fs.rmSync(dbDir, { recursive: true, force: true })
-  fs.mkdirSync(dbDir, { recursive: true })
-  migrateWorkerDb(parallelIndex)
+  await migrateWorkerDb(parallelIndex)
 
   const nextArgs = IS_DEV_MODE
     ? ['dev', '--turbo', '-p', String(nextPort)]
@@ -71,7 +78,7 @@ function startWorkerNextJs(parallelIndex: number): number {
     env: {
       ...process.env,
       PORT: String(nextPort),
-      DATABASE_URL: `file:${path.join(dbDir, 'catalyse.db')}`,
+      DATABASE_URL: workerDbUrl(parallelIndex),
       ADMIN_EMAILS: ADMIN_EMAIL,
       RESEND_API_KEY: '',
       STUB_EMAIL: 'true',
@@ -164,7 +171,7 @@ async function globalSetup(config: FullConfig): Promise<void> {
     )
     const pids: Record<string, number> = {}
     for (let i = 0; i < workerCount; i++) {
-      pids[i] = startWorkerNextJs(i)
+      pids[i] = await startWorkerNextJs(i)
     }
     fs.writeFileSync(SERVER_PIDS_FILE, JSON.stringify(pids))
 
